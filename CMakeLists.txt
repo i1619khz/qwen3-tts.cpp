@@ -15,6 +15,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
 endif()
 
+# MSVC: enable POSIX math constants (M_PI etc.), permit portable CRT (sscanf/fopen),
+# force UTF-8 source (our files are UTF-8, not the system codepage), and keep
+# windows.h lean. Mirrors the outbound-engine build flags.
+if(MSVC)
+    add_compile_definitions(_USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_compile_options(/utf-8)
+endif()
+
 # Timing instrumentation option
 option(QWEN3_TTS_TIMING "Enable detailed timing instrumentation" OFF)
 if(QWEN3_TTS_TIMING)
