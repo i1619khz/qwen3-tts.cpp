@@ -9,8 +9,12 @@
 #include <cstdint>
 #include <cstdlib>
 
-#ifdef __APPLE__
+#if defined(__APPLE__)
 #include <mach/mach.h>
+#elif defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <psapi.h>
 #else
 #include <sys/resource.h>
 #endif
@@ -45,6 +49,14 @@ static bool get_process_memory_snapshot(process_memory_snapshot & out) {
     } else {
         out.phys_footprint_bytes = out.rss_bytes;
     }
+    return true;
+#elif defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return false;
+    }
+    out.rss_bytes = (uint64_t) pmc.WorkingSetSize;
+    out.phys_footprint_bytes = out.rss_bytes;
     return true;
 #else
     struct rusage usage = {};
@@ -105,6 +117,12 @@ Qwen3TTS::Qwen3TTS() = default;
 
 Qwen3TTS::~Qwen3TTS() = default;
 
+void Qwen3TTS::reset_state() {
+    if (transformer_loaded_) {
+        transformer_.clear_kv_cache();
+    }
+}
+
 bool Qwen3TTS::load_models(const std::string & model_dir) {
     int64_t t_start = get_time_ms();
     log_memory_usage("load/start");
@@ -114,7 +132,8 @@ bool Qwen3TTS::load_models(const std::string & model_dir) {
     transformer_loaded_ = false;
     decoder_loaded_ = false;
     
-    // Construct model paths — prefer quantized (q8_0) over full-precision (f16)
+    // Construct model paths — prefer quantized (q8_0) for the transformer, but f16 for vocoder
+    // because ggml-vulkan only supports conv/transposed-conv weights as F32/F16 inputs can be promoted.
     std::string tts_model_path;
     std::string q8_path = model_dir + "/qwen3-tts-0.6b-q8_0.gguf";
     std::string f16_path = model_dir + "/qwen3-tts-0.6b-f16.gguf";
@@ -125,7 +144,16 @@ bool Qwen3TTS::load_models(const std::string & model_dir) {
     } else {
         tts_model_path = f16_path;
     }
-    std::string tokenizer_model_path = model_dir + "/qwen3-tts-tokenizer-f16.gguf";
+    std::string tokenizer_q8_path = model_dir + "/qwen3-tts-tokenizer-q8_0.gguf";
+    std::string tokenizer_f16_path = model_dir + "/qwen3-tts-tokenizer-f16.gguf";
+    std::string tokenizer_model_path;
+    FILE * tokenizer_f16_check = fopen(tokenizer_f16_path.c_str(), "r");
+    if (tokenizer_f16_check) {
+        fclose(tokenizer_f16_check);
+        tokenizer_model_path = tokenizer_f16_path;
+    } else {
+        tokenizer_model_path = tokenizer_q8_path;
+    }
     tts_model_path_ = tts_model_path;
     decoder_model_path_ = tokenizer_model_path;
     encoder_loaded_ = false;

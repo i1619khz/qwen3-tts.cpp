@@ -240,6 +240,11 @@ Qwen3TtsAudio * qwen3_tts_synthesize_with_embedding(
     return out;
 }
 
+void qwen3_tts_reset(Qwen3Tts * tts) {
+    if (!tts) return;
+    tts->engine.reset_state();
+}
+
 const char * qwen3_tts_get_error(const Qwen3Tts * tts) {
     if (!tts) return "";
     return tts->last_error.c_str();

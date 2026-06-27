@@ -135,6 +135,9 @@ public:
     // Check if models are loaded
     bool is_loaded() const { return models_loaded_; }
     
+    // Reset internal state (clear KV caches) between independent requests
+    void reset_state();
+    
 private:
     tts_result synthesize_internal(const std::string & text,
                                    const float * speaker_embedding,

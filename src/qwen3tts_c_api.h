@@ -4,6 +4,16 @@
 
 #include <stdint.h>
 
+#ifdef _WIN32
+    #ifdef QWEN3TTS_BUILDING_DLL
+        #define QWEN3TTS_API __declspec(dllexport)
+    #else
+        #define QWEN3TTS_API __declspec(dllimport)
+    #endif
+#else
+    #define QWEN3TTS_API __attribute__((visibility("default")))
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -30,37 +40,37 @@ typedef struct Qwen3TtsAudio {
 } Qwen3TtsAudio;
 
 /* Fill params with defaults */
-void qwen3_tts_default_params(Qwen3TtsParams* params);
+QWEN3TTS_API void qwen3_tts_default_params(Qwen3TtsParams* params);
 
 /* Create TTS engine and load models from directory.
  * model_dir must contain qwen3-tts-0.6b-f16.gguf and
  * qwen3-tts-tokenizer-f16.gguf.
  * Returns NULL on failure. */
-Qwen3Tts* qwen3_tts_create(const char* model_dir, int32_t n_threads);
+QWEN3TTS_API Qwen3Tts* qwen3_tts_create(const char* model_dir, int32_t n_threads);
 
 /* Check if models are loaded */
-int qwen3_tts_is_loaded(const Qwen3Tts* tts);
+QWEN3TTS_API int qwen3_tts_is_loaded(const Qwen3Tts* tts);
 
 /* Synthesize text to audio. Returns NULL on failure.
  * Caller must free with qwen3_tts_free_audio(). */
-Qwen3TtsAudio* qwen3_tts_synthesize(
+QWEN3TTS_API Qwen3TtsAudio* qwen3_tts_synthesize(
     Qwen3Tts* tts,
     const char* text,
     const Qwen3TtsParams* params);
 
 /* Get sample rate (always 24000) */
-int32_t qwen3_tts_sample_rate(const Qwen3Tts* tts);
+QWEN3TTS_API int32_t qwen3_tts_sample_rate(const Qwen3Tts* tts);
 
 /* Free generated audio */
-void qwen3_tts_free_audio(Qwen3TtsAudio* audio);
+QWEN3TTS_API void qwen3_tts_free_audio(Qwen3TtsAudio* audio);
 
 /* Destroy TTS engine */
-void qwen3_tts_destroy(Qwen3Tts* tts);
+QWEN3TTS_API void qwen3_tts_destroy(Qwen3Tts* tts);
 
 /* Synthesize with voice cloning from WAV file.
  * reference_audio_path: path to reference WAV (24kHz mono recommended).
  * Returns NULL on failure. Caller must free with qwen3_tts_free_audio(). */
-Qwen3TtsAudio* qwen3_tts_synthesize_with_voice_file(
+QWEN3TTS_API Qwen3TtsAudio* qwen3_tts_synthesize_with_voice_file(
     Qwen3Tts* tts,
     const char* text,
     const char* reference_audio_path,
@@ -69,7 +79,7 @@ Qwen3TtsAudio* qwen3_tts_synthesize_with_voice_file(
 /* Synthesize with voice cloning from raw samples.
  * ref_samples: 24kHz mono float32 normalized to [-1, 1].
  * Returns NULL on failure. Caller must free with qwen3_tts_free_audio(). */
-Qwen3TtsAudio* qwen3_tts_synthesize_with_voice_samples(
+QWEN3TTS_API Qwen3TtsAudio* qwen3_tts_synthesize_with_voice_samples(
     Qwen3Tts* tts,
     const char* text,
     const float* ref_samples,
@@ -80,7 +90,7 @@ Qwen3TtsAudio* qwen3_tts_synthesize_with_voice_samples(
  * embedding_out: caller-allocated buffer for the embedding.
  * max_size: size of embedding_out in floats.
  * Returns the actual embedding size (typically 1024), or -1 on failure. */
-int32_t qwen3_tts_extract_embedding_file(
+QWEN3TTS_API int32_t qwen3_tts_extract_embedding_file(
     Qwen3Tts* tts,
     const char* reference_audio_path,
     float* embedding_out,
@@ -90,15 +100,18 @@ int32_t qwen3_tts_extract_embedding_file(
  * embedding: speaker embedding from qwen3_tts_extract_embedding_file().
  * embedding_size: must match the size returned by extract.
  * Returns NULL on failure. Caller must free with qwen3_tts_free_audio(). */
-Qwen3TtsAudio* qwen3_tts_synthesize_with_embedding(
+QWEN3TTS_API Qwen3TtsAudio* qwen3_tts_synthesize_with_embedding(
     Qwen3Tts* tts,
     const char* text,
     const float* embedding,
     int32_t embedding_size,
     const Qwen3TtsParams* params);
 
+/* Reset/clear internal state (e.g. KV caches) between independent requests */
+QWEN3TTS_API void qwen3_tts_reset(Qwen3Tts* tts);
+
 /* Get last error message (or empty string) */
-const char* qwen3_tts_get_error(const Qwen3Tts* tts);
+QWEN3TTS_API const char* qwen3_tts_get_error(const Qwen3Tts* tts);
 
 #ifdef __cplusplus
 }
