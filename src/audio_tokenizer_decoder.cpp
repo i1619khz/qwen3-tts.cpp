@@ -1,11 +1,15 @@
 #include "audio_tokenizer_decoder.h"
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
+#include "ggml-alloc.h"
 
 #include <cmath>
 #include <cstring>
 #include <algorithm>
 #include <numeric>
+#ifdef QWEN3_TTS_TIMING
+#include <chrono>
+#endif
 
 #define QWEN3_TTS_DEC_MAX_NODES 32768
 
@@ -41,13 +45,21 @@ void AudioTokenizerDecoder::normalize_codebooks() {
     const float epsilon = 1e-5f;
     
     auto normalize_codebook = [epsilon](struct ggml_tensor * codebook, struct ggml_tensor * usage, const char *) {
-        if (!codebook || !usage || !codebook->data || !usage->data) return;
+        if (!codebook || !usage) return;
         
         int64_t codebook_dim = codebook->ne[0];
         int64_t codebook_size = codebook->ne[1];
+        size_t cb_bytes = ggml_nbytes(codebook);
+        size_t usage_bytes = ggml_nbytes(usage);
         
-        ggml_fp16_t * cb_data = (ggml_fp16_t *)codebook->data;
-        float * usage_data = (float *)usage->data;
+        // Download data from GPU to host for normalization
+        std::vector<uint8_t> cb_host(cb_bytes);
+        std::vector<uint8_t> usage_host(usage_bytes);
+        ggml_backend_tensor_get(codebook, cb_host.data(), 0, cb_bytes);
+        ggml_backend_tensor_get(usage, usage_host.data(), 0, usage_bytes);
+        
+        ggml_fp16_t * cb_data = (ggml_fp16_t *)cb_host.data();
+        float * usage_data = (float *)usage_host.data();
         
         for (int64_t emb_idx = 0; emb_idx < codebook_size; ++emb_idx) {
             float u = usage_data[emb_idx];
@@ -61,6 +73,8 @@ void AudioTokenizerDecoder::normalize_codebooks() {
             }
         }
         
+        // Upload normalized data back to GPU
+        ggml_backend_tensor_set(codebook, cb_host.data(), 0, cb_bytes);
     };
     
     normalize_codebook(model_.vq_first_codebook, model_.vq_first_usage, "first");
@@ -128,7 +142,17 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
             continue;
         }
         
-        struct ggml_tensor * tensor = ggml_dup_tensor(model_.ctx, meta_tensor);
+        struct ggml_tensor * tensor = nullptr;
+        const std::string sname_for_type(name);
+        const bool promote_conv_transpose_weight_to_f32 =
+            meta_tensor->type == GGML_TYPE_F16 &&
+            ((sname_for_type.find("tok_dec.upsample.") == 0 && sname_for_type.find(".conv.weight") != std::string::npos) ||
+             (sname_for_type.find("tok_dec.dec.") == 0 && sname_for_type.find(".conv_t.weight") != std::string::npos));
+        if (promote_conv_transpose_weight_to_f32) {
+            tensor = ggml_new_tensor(model_.ctx, GGML_TYPE_F32, ggml_n_dims(meta_tensor), meta_tensor->ne);
+        } else {
+            tensor = ggml_dup_tensor(model_.ctx, meta_tensor);
+        }
         ggml_set_name(tensor, name);
         
         model_.tensors[name] = tensor;
@@ -315,10 +339,74 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
     }
     
-    if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx,
-                                     model_.tensors, model_.buffer, error_msg_,
-                                     GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+    // Initialize backends BEFORE loading tensors so we can allocate on GPU
+    state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
+    if (!state_.backend) {
         return false;
+    }
+
+    ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
+    {
+        const char * dev_name = device ? ggml_backend_dev_name(device) : "null";
+        auto dev_type = device ? ggml_backend_dev_type(device) : GGML_BACKEND_DEVICE_TYPE_CPU;
+        const char * type_str = dev_type == GGML_BACKEND_DEVICE_TYPE_GPU ? "GPU" :
+                                dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU ? "IGPU" :
+                                dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL ? "ACCEL" : "CPU";
+        fprintf(stderr, "  Vocoder backend: %s (%s)\n", dev_name, type_str);
+    }
+
+    // Allocate tensors on the GPU backend (same backend instance as the scheduler).
+    // ggml_conv_1d is decomposed into im2col + mul_mat, both supported by Vulkan.
+    model_.buffer = ggml_backend_alloc_ctx_tensors(model_.ctx, state_.backend);
+    if (!model_.buffer) {
+        error_msg_ = "Failed to allocate tensor buffer on GPU backend";
+        return false;
+    }
+
+    // Load tensor data from file into GPU buffers
+    {
+        FILE * f = fopen(model_path.c_str(), "rb");
+        if (!f) {
+            error_msg_ = "Failed to open model file: " + model_path;
+            return false;
+        }
+        const size_t data_offset = gguf_get_data_offset(gguf_ctx);
+        const int64_t n_tensors = gguf_get_n_tensors(gguf_ctx);
+        std::vector<uint8_t> read_buf;
+
+        for (int64_t i = 0; i < n_tensors; ++i) {
+            const char * name = gguf_get_tensor_name(gguf_ctx, i);
+            size_t offset = gguf_get_tensor_offset(gguf_ctx, i);
+
+            auto it = model_.tensors.find(name);
+            if (it == model_.tensors.end()) continue;
+
+            struct ggml_tensor * tensor = it->second;
+            struct ggml_tensor * meta_tensor = ggml_get_tensor(meta_ctx, name);
+            size_t src_nbytes = meta_tensor ? ggml_nbytes(meta_tensor) : ggml_nbytes(tensor);
+            size_t dst_nbytes = ggml_nbytes(tensor);
+            read_buf.resize(src_nbytes);
+
+            if (fseek(f, data_offset + offset, SEEK_SET) != 0) {
+                error_msg_ = "Failed to seek to tensor: " + std::string(name);
+                fclose(f);
+                return false;
+            }
+            if (fread(read_buf.data(), 1, src_nbytes, f) != src_nbytes) {
+                error_msg_ = "Failed to read tensor: " + std::string(name);
+                fclose(f);
+                return false;
+            }
+
+            if (meta_tensor && meta_tensor->type == GGML_TYPE_F16 && tensor->type == GGML_TYPE_F32) {
+                std::vector<float> f32_buf(ggml_nelements(tensor));
+                ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(read_buf.data()), f32_buf.data(), ggml_nelements(tensor));
+                ggml_backend_tensor_set(tensor, f32_buf.data(), 0, dst_nbytes);
+            } else {
+                ggml_backend_tensor_set(tensor, read_buf.data(), 0, dst_nbytes);
+            }
+        }
+        fclose(f);
     }
     
     for (int i = 0; i < 4; ++i) {
@@ -328,25 +416,6 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     }
     
     normalize_codebooks();
-    // Codebooks are normalized in host memory; sync once to backend tensors.
-    auto upload_if_present = [](struct ggml_tensor * t) {
-        if (t && t->data) {
-            ggml_backend_tensor_set(t, t->data, 0, ggml_nbytes(t));
-        }
-    };
-    upload_if_present(model_.vq_first_codebook);
-    for (int i = 0; i < 15; ++i) {
-        upload_if_present(model_.vq_rest_codebook[i]);
-    }
-    
-    state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
-    if (!state_.backend) {
-        return false;
-    }
-
-    ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
-    const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
-    fprintf(stderr, "  AudioTokenizerDecoder backend: %s\n", device_name);
     
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -809,6 +878,20 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     }
     
     const auto & cfg = model_.config;
+
+#ifdef QWEN3_TTS_TIMING
+    using clk = std::chrono::high_resolution_clock;
+    auto t_decode_start = clk::now();
+    auto t0 = t_decode_start;
+    auto t1 = t_decode_start;
+    double t_repack_ms = 0.0;
+    double t_graph_build_ms = 0.0;
+    double t_graph_alloc_ms = 0.0;
+    double t_input_ms = 0.0;
+    double t_compute_ms = 0.0;
+    double t_output_ms = 0.0;
+    double t_reset_ms = 0.0;
+#endif
     
     codes_buf_.resize(n_frames * cfg.n_codebooks);
     for (int f = 0; f < n_frames; ++f) {
@@ -816,13 +899,31 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
             codes_buf_[cb + f * cfg.n_codebooks] = codes[f * cfg.n_codebooks + cb];
         }
     }
+
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    t_repack_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = t1;
+#endif
     
     struct ggml_cgraph * gf = build_graph(n_frames);
+
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    t_graph_build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = t1;
+#endif
     
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";
         return false;
     }
+
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    t_graph_alloc_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = t1;
+#endif
     
     std::vector<int32_t> cb_codes(n_frames);
     for (int cb = 0; cb < 16; ++cb) {
@@ -853,14 +954,24 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         ggml_backend_tensor_set(positions_tensor, positions.data(), 0, 
                                 n_frames * sizeof(int32_t));
     }
-    
 
-    
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    t_input_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = t1;
+#endif    
+
     if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
         error_msg_ = "Failed to compute graph";
         ggml_backend_sched_reset(state_.sched);
         return false;
     }
+
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    t_compute_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = t1;
+#endif
     
     struct ggml_tensor * audio_tensor = ggml_graph_get_tensor(gf, "audio");
     if (!audio_tensor) {
@@ -872,8 +983,29 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     int64_t n_samples = audio_tensor->ne[0];
     samples.resize(n_samples);
     ggml_backend_tensor_get(audio_tensor, samples.data(), 0, n_samples * sizeof(float));
+
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    t_output_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = t1;
+#endif
     
     ggml_backend_sched_reset(state_.sched);
+
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    t_reset_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double t_total_ms = std::chrono::duration<double, std::milli>(t1 - t_decode_start).count();
+    fprintf(stderr, "\n=== Vocoder Decode Timing (%d frames, %lld samples) ===\n", n_frames, (long long)n_samples);
+    fprintf(stderr, "  Repack codes:      %8.1f ms\n", t_repack_ms);
+    fprintf(stderr, "  Graph build:       %8.1f ms\n", t_graph_build_ms);
+    fprintf(stderr, "  Graph alloc:       %8.1f ms\n", t_graph_alloc_ms);
+    fprintf(stderr, "  Input set:         %8.1f ms\n", t_input_ms);
+    fprintf(stderr, "  Compute:           %8.1f ms\n", t_compute_ms);
+    fprintf(stderr, "  Output get:        %8.1f ms\n", t_output_ms);
+    fprintf(stderr, "  Sched reset:       %8.1f ms\n", t_reset_ms);
+    fprintf(stderr, "  Total decode:      %8.1f ms\n", t_total_ms);
+#endif
     
     return true;
 }

@@ -184,6 +184,14 @@ struct tts_transformer_state {
     
     tts_kv_cache cache;           // Talker KV cache (28 layers)
     tts_kv_cache code_pred_cache; // Code predictor KV cache (5 layers)
+
+    // Persistent code predictor graphs (pre-built, reused every frame)
+    // Each graph has its own compute buffer and ggml context to avoid conflicts
+    static constexpr int CODE_PRED_N_GRAPHS = 15;  // 1 prefill + 14 step
+    std::vector<uint8_t> code_pred_meta[CODE_PRED_N_GRAPHS];
+    struct ggml_context * code_pred_ctx[CODE_PRED_N_GRAPHS] = {};
+    struct ggml_cgraph * code_pred_graph[CODE_PRED_N_GRAPHS] = {};
+    bool code_pred_graphs_ready = false;
 };
 
 // TTS Transformer class
@@ -316,6 +324,11 @@ private:
     // Build computation graph for 2-token prefill of code predictor
     // Processes [past_hidden, codec_embd(codebook_0_token)] together
     struct ggml_cgraph * build_code_pred_prefill_graph();
+
+    // Build persistent graphs for code predictor (1 prefill + 14 step graphs)
+    // These are stored in state_ and reused across frames
+    bool build_persistent_code_pred_graphs();
+    void free_persistent_code_pred_graphs();
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);
@@ -324,7 +337,7 @@ private:
     bool create_tensors(struct gguf_context * ctx);
     
     // Load tensor data from file
-    bool load_tensor_data(const std::string & path, struct gguf_context * ctx);
+    bool load_tensor_data(const std::string & path, struct gguf_context * ctx, ggml_backend_t backend);
     
     tts_transformer_model model_;
     tts_transformer_state state_;
