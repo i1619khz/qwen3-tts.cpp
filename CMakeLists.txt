@@ -30,9 +30,14 @@ endif()
 # Find threads
 find_package(Threads REQUIRED)
 
-# GGML library paths
-set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
-set(GGML_BUILD_DIR "${GGML_DIR}/build")
+# GGML library paths — overridable via -DGGML_DIR=<path> so the fork can build
+# against an external ggml (e.g. llama.cpp's ggml) instead of the bundled submodule.
+if(NOT GGML_DIR)
+    set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
+endif()
+if(NOT GGML_BUILD_DIR)
+    set(GGML_BUILD_DIR "${GGML_DIR}/build")
+endif()
 
 # Detect Metal backend availability
 if(APPLE AND EXISTS "${GGML_BUILD_DIR}/src/ggml-metal/libggml-metal.dylib")
