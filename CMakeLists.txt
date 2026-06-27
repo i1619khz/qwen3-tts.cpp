@@ -183,10 +183,16 @@ target_link_libraries(qwen3_tts PUBLIC
 add_library(qwen3tts_shared SHARED
     src/qwen3tts_c_api.cpp
 )
+# Build the shared lib so its C-API symbols are exported. qwen3tts_c_api.cpp
+# defines functions without the QWEN3TTS_API dllexport marker, so rely on
+# CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS to export all extern "C" functions
+# (and more) from the DLL — guarantees FFI loaders (koffi) can bind every
+# qwen3_tts_* entry without decorating each definition.
 set_target_properties(qwen3tts_shared PROPERTIES
     OUTPUT_NAME "qwen3tts"
     VERSION ${PROJECT_VERSION}
     SOVERSION 0
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
 target_include_directories(qwen3tts_shared PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
